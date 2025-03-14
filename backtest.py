@@ -104,18 +104,99 @@ class OnePercentBacktest:
         
         total_trades = len(self.trades)
         profitable_trades = len([t for t in self.trades if t['pl'] > 0])
+        losing_trades = total_trades - profitable_trades
         total_pl = sum(t['pl'] for t in self.trades)
         win_rate = profitable_trades / total_trades if total_trades > 0 else 0
         
+        # Calculate additional statistics
+        if profitable_trades > 0:
+            avg_profit = sum(t['pl'] for t in self.trades if t['pl'] > 0) / profitable_trades
+            max_profit = max(t['pl'] for t in self.trades if t['pl'] > 0)
+        else:
+            avg_profit = 0
+            max_profit = 0
+            
+        if losing_trades > 0:
+            avg_loss = sum(t['pl'] for t in self.trades if t['pl'] <= 0) / losing_trades
+            max_loss = min(t['pl'] for t in self.trades if t['pl'] <= 0)
+        else:
+            avg_loss = 0
+            max_loss = 0
+        
+        target_exits = len([t for t in self.trades if t['exit_type'] == 'target'])
+        stop_exits = len([t for t in self.trades if t['exit_type'] == 'stop'])
+        
         return {
-            'Initial Capital': self.initial_capital,
-            'Final Capital': self.capital,
+            'Initial Capital': f"${self.initial_capital:,.2f}",
+            'Final Capital': f"${self.capital:,.2f}",
             'Total Return': f"{((self.capital - self.initial_capital) / self.initial_capital * 100):.2f}%",
             'Total Trades': total_trades,
             'Profitable Trades': profitable_trades,
+            'Losing Trades': losing_trades,
             'Win Rate': f"{win_rate * 100:.2f}%",
-            'Total P/L': f"${total_pl:.2f}"
+            'Total P/L': f"${total_pl:,.2f}",
+            'Average Profit': f"${avg_profit:,.2f}",
+            'Average Loss': f"${avg_loss:,.2f}",
+            'Max Profit': f"${max_profit:,.2f}",
+            'Max Loss': f"${max_loss:,.2f}",
+            'Target Exits': target_exits,
+            'Stop-Loss Exits': stop_exits
         }
+
+    def get_trade_summary(self):
+        """Generate a summary of trade performance by day."""
+        if not self.trades:
+            return "No trades to summarize"
+            
+        # Convert trades to DataFrame for analysis
+        df = pd.DataFrame(self.trades)
+        df['entry_time'] = pd.to_datetime(df['entry_time'])
+        df['exit_time'] = pd.to_datetime(df['exit_time'])
+        df['trade_duration'] = df['exit_time'] - df['entry_time']
+        
+        # Group trades by day
+        df['date'] = df['entry_time'].dt.date
+        daily_summary = df.groupby('date').agg({
+            'pl': ['count', 'sum', 'mean'],
+            'exit_type': lambda x: x.value_counts().to_dict()
+        }).round(2)
+        
+        return daily_summary
+
+    def get_summary(self):
+        """Get a concise summary of trading performance."""
+        if not self.trades:
+            return "No trades executed during this period."
+            
+        # Calculate key metrics
+        total_trades = len(self.trades)
+        profitable_trades = len([t for t in self.trades if t['pl'] > 0])
+        total_pl = sum(t['pl'] for t in self.trades)
+        win_rate = (profitable_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        # Calculate holding times
+        trade_durations = []
+        for trade in self.trades:
+            entry = pd.to_datetime(trade['entry_time'])
+            exit = pd.to_datetime(trade['exit_time'])
+            duration = exit - entry
+            trade_durations.append(duration)
+        
+        avg_duration = sum(trade_durations, pd.Timedelta(0)) / len(trade_durations) if trade_durations else pd.Timedelta(0)
+        
+        # Format summary
+        summary = f"""
+=== Trading Summary ===
+Initial Capital: ${self.initial_capital:,.2f}
+Final Capital: ${self.capital:,.2f}
+Total Profit/Loss: ${total_pl:,.2f} ({((self.capital - self.initial_capital) / self.initial_capital * 100):.2f}% return)
+Number of Trades: {total_trades}
+Win Rate: {win_rate:.1f}%
+Average Trade Duration: {str(avg_duration).split('.')[0]}  # Removing microseconds
+Best Trade: ${max([t['pl'] for t in self.trades], default=0):,.2f}
+Worst Trade: ${min([t['pl'] for t in self.trades], default=0):,.2f}
+"""
+        return summary
 
 def main():
     # Get user input
@@ -132,26 +213,39 @@ def main():
     print(f"\nRunning backtest for {symbol} from {start_date.date()} to {end_date.date()}...")
     backtest.run_backtest(start_date, end_date)
     
-    # Print results
-    print("\nBacktest Results:")
-    stats = backtest.get_stats()
-    if isinstance(stats, str):
-        print(stats)
-    else:
-        for key, value in stats.items():
-            print(f"{key}: {value}")
-        
-        # Print detailed trade log
-        print("\nDetailed Trade Log:")
-        for i, trade in enumerate(backtest.trades, 1):
-            print(f"\nTrade {i}:")
-            print(f"Entry Time: {trade['entry_time']}")
-            print(f"Exit Time: {trade['exit_time']}")
-            print(f"Entry Price: ${trade['entry_price']:.2f}")
-            print(f"Exit Price: ${trade['exit_price']:.2f}")
-            print(f"Shares: {trade['shares']}")
-            print(f"P/L: ${trade['pl']:.2f}")
-            print(f"Exit Type: {trade['exit_type']}")
+    # Print summary first
+    print(backtest.get_summary())
+    
+    # Ask if user wants detailed statistics
+    show_details = input("\nWould you like to see detailed statistics? (y/n): ").lower() == 'y'
+    
+    if show_details:
+        print("\n=== Detailed Statistics ===")
+        stats = backtest.get_stats()
+        if isinstance(stats, str):
+            print(stats)
+        else:
+            for key, value in stats.items():
+                print(f"{key}: {value}")
+            
+            print("\n=== Daily Trade Summary ===")
+            daily_summary = backtest.get_trade_summary()
+            if isinstance(daily_summary, str):
+                print(daily_summary)
+            else:
+                print("\nDaily Performance:")
+                print(daily_summary)
+            
+            print("\n=== Detailed Trade Log ===")
+            for i, trade in enumerate(backtest.trades, 1):
+                print(f"\nTrade {i}:")
+                print(f"Entry Time: {trade['entry_time']}")
+                print(f"Exit Time: {trade['exit_time']}")
+                print(f"Entry Price: ${trade['entry_price']:.2f}")
+                print(f"Exit Price: ${trade['exit_price']:.2f}")
+                print(f"Shares: {trade['shares']}")
+                print(f"P/L: ${trade['pl']:.2f}")
+                print(f"Exit Type: {trade['exit_type']}")
 
 if __name__ == "__main__":
     main()
