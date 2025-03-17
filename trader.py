@@ -1,9 +1,9 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -40,10 +40,17 @@ class OnePercentTrader:
     def get_current_price(self):
         """Get the current price of the symbol."""
         try:
+            # Use proper datetime objects
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(minutes=10)  # Get data for the last 10 minutes
+            
+            logging.info(f"Getting current price for {self.symbol}")
+            
             request = StockBarsRequest(
                 symbol_or_symbols=[self.symbol],
                 timeframe=TimeFrame.Minute,
-                start=datetime.now().date()
+                start=start_dt,
+                end=end_dt
             )
             bars = data_client.get_stock_bars(request)
             return bars[self.symbol][-1].close
@@ -71,10 +78,10 @@ class OnePercentTrader:
             order = trading_client.submit_order(order_details)
             
             # Wait for order to fill
-            filled_order = trading_client.get_order(order.id)
+            filled_order = trading_client.get_order_by_id(order.id)
             while filled_order.status != 'filled':
                 time.sleep(1)
-                filled_order = trading_client.get_order(order.id)
+                filled_order = trading_client.get_order_by_id(order.id)
 
             self.entry_price = float(filled_order.filled_avg_price)
             self.position = filled_order
@@ -95,24 +102,52 @@ class OnePercentTrader:
             # Calculate target and stop prices
             target_price = self.entry_price * (1 + self.target_profit_pct)
             stop_price = self.entry_price * (1 - self.stop_loss_pct)
+            
+            # Round prices to 2 decimal places for stocks
+            target_price = round(target_price, 2)
+            stop_price = round(stop_price, 2)
+            
+            logging.info(f"Entry price: {self.entry_price}, Target price: {target_price}, Stop price: {stop_price}")
 
-            # Place take-profit limit order
+            # Cancel any existing orders for this symbol
+            orders = trading_client.get_orders()
+            for order in orders:
+                if order.symbol == self.symbol:
+                    try:
+                        trading_client.cancel_order_by_id(order.id)
+                        logging.info(f"Cancelled existing order {order.id}")
+                    except Exception as e:
+                        logging.warning(f"Could not cancel order {order.id}: {e}")
+            
+            # Get the quantity from the position object
+            # Handle both order-filled positions and existing positions from API
+            if hasattr(self.position, 'filled_qty'):
+                qty = self.position.filled_qty
+            elif hasattr(self.position, 'qty'):
+                qty = self.position.qty
+            else:
+                raise ValueError(f"Position object doesn't have a quantity attribute: {self.position}")
+            
+            logging.info(f"Using quantity: {qty} shares for exit orders")
+            
+            # Place separate orders for take-profit and stop-loss
+            # First, place the take-profit limit order
             tp_order = LimitOrderRequest(
                 symbol=self.symbol,
-                qty=self.position.filled_qty,
+                qty=qty,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=TimeInForce.GTC,
                 limit_price=target_price
             )
             trading_client.submit_order(tp_order)
             logging.info(f"Take-profit order placed at {target_price}")
-
-            # Place stop-loss order
+            
+            # Then place the stop-loss order
             sl_order = StopOrderRequest(
                 symbol=self.symbol,
-                qty=self.position.filled_qty,
+                qty=qty,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=TimeInForce.GTC,
                 stop_price=stop_price
             )
             trading_client.submit_order(sl_order)
@@ -124,6 +159,40 @@ class OnePercentTrader:
             logging.error(f"Error placing sell orders: {e}")
             return False
 
+    def check_and_handle_existing_position(self):
+        """Check for existing positions and create exit orders if needed."""
+        try:
+            # Get all positions
+            positions = trading_client.get_all_positions()
+            position = next((p for p in positions if p.symbol == self.symbol), None)
+            
+            if position:
+                logging.info(f"Found existing position for {self.symbol}: {position.qty} shares at avg price {position.avg_entry_price}")
+                
+                # Check if there are any existing orders for this symbol
+                orders = trading_client.get_orders()
+                has_tp_order = any(o.symbol == self.symbol and o.side == 'sell' and o.type == 'limit' for o in orders)
+                has_sl_order = any(o.symbol == self.symbol and o.side == 'sell' and o.type == 'stop' for o in orders)
+                
+                # Set up the position and entry price
+                self.position = position
+                self.entry_price = float(position.avg_entry_price)
+                
+                if not has_tp_order or not has_sl_order:
+                    logging.info(f"Missing exit orders for existing position. Creating exit orders...")
+                    # Create exit orders
+                    self.place_sell_orders()
+                else:
+                    logging.info(f"Exit orders already exist for {self.symbol}. Continuing monitoring...")
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error checking existing positions: {e}")
+            return False
+
     def check_market_conditions(self):
         """
         Check if market conditions are favorable for trading.
@@ -131,11 +200,19 @@ class OnePercentTrader:
         """
         try:
             # Get recent price data
+        # Use datetime objects properly formatted for Alpaca API
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(hours=120)  # Get data for the last 24 hours
+        
+            logging.info(f"Requesting bars for {self.symbol} from {start_dt.isoformat()} to {end_dt.isoformat()}")
+        
             request = StockBarsRequest(
                 symbol_or_symbols=[self.symbol],
                 timeframe=TimeFrame.Hour,
-                start=datetime.now().date()
+                start=start_dt,
+                end=end_dt
             )
+            
             bars = data_client.get_stock_bars(request)
             
             # Simple volume check
@@ -143,6 +220,7 @@ class OnePercentTrader:
             avg_volume = sum(bar.volume for bar in bars[self.symbol]) / len(bars[self.symbol])
             
             return recent_volume > avg_volume * 0.8  # 80% of average volume
+        
         except Exception as e:
             logging.error(f"Error checking market conditions: {e}")
             return False
@@ -161,9 +239,8 @@ class OnePercentTrader:
                     continue
 
                 # Check if we have any existing position
-                positions = trading_client.get_all_positions()
-                if any(p.symbol == self.symbol for p in positions):
-                    logging.info("Position already exists. Monitoring...")
+                if self.check_and_handle_existing_position():
+                    logging.info("Existing position found. Monitoring...")
                     time.sleep(60)
                     continue
 
