@@ -3,8 +3,11 @@ import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest, StopOrderRequest,
+    OrderRequest, TakeProfitRequest, StopLossRequest
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -36,6 +39,7 @@ class OnePercentTrader:
         self.entry_price = None
         self.target_profit_pct = 0.01  # 1%
         self.stop_loss_pct = 0.005     # 0.5%
+        self.order_states = {}
 
     def get_current_price(self):
         """Get the current price of the symbol."""
@@ -94,69 +98,81 @@ class OnePercentTrader:
             return False
 
     def place_sell_orders(self):
-        """Place take-profit and stop-loss orders."""
-        if not self.position or not self.entry_price:
-            return False
-
+        """Smart order placement with quantity validation"""
         try:
-            # Calculate target and stop prices
-            target_price = self.entry_price * (1 + self.target_profit_pct)
-            stop_price = self.entry_price * (1 - self.stop_loss_pct)
-            
-            # Round prices to 2 decimal places for stocks
-            target_price = round(target_price, 2)
-            stop_price = round(stop_price, 2)
-            
-            logging.info(f"Entry price: {self.entry_price}, Target price: {target_price}, Stop price: {stop_price}")
+            if not self.position:
+                return False
 
-            # Cancel any existing orders for this symbol
-            orders = trading_client.get_orders()
-            for order in orders:
-                if order.symbol == self.symbol:
-                    try:
-                        trading_client.cancel_order_by_id(order.id)
-                        logging.info(f"Cancelled existing order {order.id}")
-                    except Exception as e:
-                        logging.warning(f"Could not cancel order {order.id}: {e}")
+            # Get REAL available shares
+            position = trading_client.get_open_position(self.symbol)
+            available_qty = int(position.qty_available)
             
-            # Get the quantity from the position object
-            # Handle both order-filled positions and existing positions from API
-            if hasattr(self.position, 'filled_qty'):
-                qty = self.position.filled_qty
-            elif hasattr(self.position, 'qty'):
-                qty = self.position.qty
-            else:
-                raise ValueError(f"Position object doesn't have a quantity attribute: {self.position}")
-            
-            logging.info(f"Using quantity: {qty} shares for exit orders")
-            
-            # Place separate orders for take-profit and stop-loss
-            # First, place the take-profit limit order
-            tp_order = LimitOrderRequest(
+            if available_qty <= 0:
+                logging.error("No shares available for trading")
+                return False
+
+            # Calculate prices
+            target_price = round(float(position.avg_entry_price) * 1.01, 2)
+            stop_price = round(float(position.avg_entry_price) * 0.99, 2)
+
+            # Place bracket order
+            bracket_order = OrderRequest(
                 symbol=self.symbol,
-                qty=qty,
+                qty=str(available_qty),
                 side=OrderSide.SELL,
+                type=OrderType.LIMIT,
                 time_in_force=TimeInForce.GTC,
-                limit_price=target_price
+                limit_price=str(target_price),
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=str(target_price)),
+                stop_loss=StopLossRequest(stop_price=str(stop_price))
             )
-            trading_client.submit_order(tp_order)
-            logging.info(f"Take-profit order placed at {target_price}")
             
-            # Then place the stop-loss order
-            sl_order = StopOrderRequest(
-                symbol=self.symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                stop_price=stop_price
-            )
-            trading_client.submit_order(sl_order)
-            logging.info(f"Stop-loss order placed at {stop_price}")
-            
+            trading_client.submit_order(bracket_order)
+            logging.info(f"✅ Bracket order placed for {available_qty} shares")
             return True
 
         except Exception as e:
-            logging.error(f"Error placing sell orders: {e}")
+            logging.error(f"Order placement failed: {str(e)[:200]}")
+            return False
+
+    def cancel_existing_orders(self):
+        """Cancel orders with retries and verification"""
+        try:
+            # First pass cancellation
+            orders = trading_client.get_orders(status='open')
+            for order in orders:
+                if order.symbol == self.symbol:
+                    trading_client.cancel_order_by_id(order.id)
+                    logging.info(f"Initiated cancellation for order {order.id}")
+
+            # Verify cancellation
+            retries = 0
+            while retries < 3:
+                remaining_orders = [
+                    o for o in trading_client.get_orders(status='open') 
+                    if o.symbol == self.symbol
+                ]
+                
+                if not remaining_orders:
+                    break
+                    
+                for order in remaining_orders:
+                    trading_client.cancel_order_by_id(order.id)
+                    logging.warning(f"Retrying cancellation for {order.id}")
+                
+                time.sleep(1)
+                retries += 1
+
+            # Final check
+            if remaining_orders:
+                logging.error(f"Failed to cancel orders: {[o.id for o in remaining_orders]}")
+                return False
+                
+            return True
+
+        except Exception as e:
+            logging.error(f"Order cancellation error: {str(e)[:200]}")
             return False
 
     def check_and_handle_existing_position(self):
@@ -225,6 +241,23 @@ class OnePercentTrader:
             logging.error(f"Error checking market conditions: {e}")
             return False
 
+    def monitor_orders(self):
+        """Track order state changes with expiry alerts"""
+        try:
+            orders = trading_client.get_orders()
+            for order in orders:
+                if order.symbol == self.symbol:
+                    status = order.status.value
+                    if status != self.order_states.get(order.id):
+                        logging.info(f"Order {order.id} changed to {status}")
+                        self.order_states[order.id] = status
+                    
+                    # Alert on stale orders
+                    if (datetime.now() - order.created_at).seconds > 3600:
+                        logging.warning(f"Stale order {order.id} ({status}) older than 1 hour")
+        except Exception as e:
+            logging.error(f"Order monitoring failed: {str(e)[:200]}")
+
     def run(self):
         """Main trading loop."""
         logging.info(f"Starting trading bot for {self.symbol}")
@@ -255,11 +288,16 @@ class OnePercentTrader:
                     # Place take-profit and stop-loss orders
                     self.place_sell_orders()
 
+                self.monitor_orders()
+
                 time.sleep(60)  # Wait for 1 minute before next iteration
 
             except Exception as e:
                 logging.error(f"Error in main loop: {e}")
                 time.sleep(60)
+
+    def _get_position_quantity(self):
+        return self.position.qty if hasattr(self.position, 'qty') else self.position.filled_qty
 
 if __name__ == "__main__":
     # Create .env file if it doesn't exist
